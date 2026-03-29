@@ -1,0 +1,19 @@
+{
+  "6484788124": {
+    "logged_in": true,
+    "phone": "+12272081426",
+    "source_chat": "-1002304434596",
+    "source_chat_name": "Withdraw problem",
+    "destinations": [
+      {
+        "id": "-1002079329348",
+        "name": "\ud83d\udfe2\ud835\udc01\ud835\udc03\ud835\udc06 \ud835\udc16\ud835\udc08\ud835\udc0d \ud835\udc0c\ud835\udc00\ud835\udc17\ud835\udc08\ud835\udc04 \ud835\udfd1 \ud835\udc0c\ud835\udc08\ud835\udc0d \ud835\udc16\ud835\udc08\ud835\udc0d\ud835\udc06\ud835\udc0e\ud83d\udd34"
+      }
+    ],
+    "forwarding_active": true,
+    "current_step": null,
+    "forward_with_tag": false,
+    "api_id": 24564243,
+    "api_hash": "9e4b802730a81edc846828fec9d8f073"
+  }
+}
