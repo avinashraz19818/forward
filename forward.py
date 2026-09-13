@@ -21,8 +21,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict, OrderedDict
 
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import Message, InputDocument, InputPhoto
+from telethon import TelegramClient, events, Button, utils
+from telethon.tl.types import (
+    Message, InputDocument, InputPhoto, DocumentAttributeFilename,
+    InputMediaUploadedDocument, InputMediaUploadedPhoto
+)
 from telethon.errors import (
     FloodWaitError, ChatWriteForbiddenError,
     ChannelPrivateError, UserBannedInChannelError,
@@ -344,12 +347,17 @@ class ForwarderBot:
             self.configs[key] = {
                 "logged_in": False, "phone": None, "api_id": None, "api_hash": None,
                 "source_chat": None, "source_chat_name": "Not Set", "destinations": [],
-                "forwarding_active": False, "forward_with_tag": False, "current_step": None
+                "forwarding_active": False, "forward_with_tag": False, "current_step": None,
+                "filter_urls": True
             }
         return self.configs[key]
     
     def save_config(self, user_id: int):
         self._save_json(CONFIGS_FILE, self.configs)
+
+    def want_url_filters(self, user_id: int) -> bool:
+        """Should text filters also rewrite the hidden URL of hyperlinks?"""
+        return bool(self.get_config(user_id).get("filter_urls", True))
     
     def get_filters(self, user_id: int) -> dict:
         key = str(user_id)
@@ -495,28 +503,74 @@ class ForwarderBot:
         return out
 
     @staticmethod
-    def _clone_entity(ent, offset: int, length: int):
+    def _clone_entity(ent, offset: Optional[int] = None,
+                      length: Optional[int] = None, extra: Optional[dict] = None):
+        """Rebuild a TL entity, overriding only the fields we care about.
+
+        Generic on purpose: MessageEntityTextUrl also needs `url`,
+        MentionName needs `user_id`, CustomEmoji needs `document_id`.
+        """
         try:
             kwargs = {k: v for k, v in vars(ent).items() if not k.startswith("_")}
-            kwargs["offset"] = offset
-            kwargs["length"] = length
+            if offset is not None:
+                kwargs["offset"] = offset
+            if length is not None:
+                kwargs["length"] = length
+            kwargs.update(extra or {})
             return type(ent)(**kwargs)
         except Exception:
             try:                    # fall back to in-place mutation
-                ent.offset = offset
-                ent.length = length
+                if offset is not None:
+                    ent.offset = offset
+                if length is not None:
+                    ent.length = length
+                for k, v in (extra or {}).items():
+                    setattr(ent, k, v)
                 return ent
             except Exception:
                 return None
 
-    def apply_text_filters(self, text: Optional[str], entities: Optional[list],
-                           filters: Optional[list]) -> Tuple[str, list]:
-        if not text:
-            return (text or ""), list(entities or [])
-        if not filters:
-            return text, list(entities or [])
+    @staticmethod
+    def _apply_filters_to_string(value: str, filters: list) -> str:
+        """Plain find/replace over a string (no entities to remap)."""
+        for f in filters or []:
+            try:
+                find = f["find"]
+                replace = f.get("replace", "")
+            except (KeyError, TypeError):
+                continue
+            if find and find in value:
+                value = value.replace(find, replace)
+        return value
 
-        result = text
+    def _filter_entity_urls(self, entities: list, filters: list) -> list:
+        """Apply text filters to the hidden URL of hyperlink entities too.
+
+        Telegram's "create link" produces MessageEntityTextUrl: the visible text
+        says e.g. "Join Now" while the real destination lives in `url`. Filtering
+        only the visible text left those links pointing at the source channel.
+        """
+        out = []
+        for ent in entities or []:
+            kept = ent
+            url = getattr(ent, "url", None)
+            if isinstance(url, str) and url:
+                new_url = self._apply_filters_to_string(url, filters)
+                if new_url != url and new_url:
+                    clone = self._clone_entity(ent, extra={"url": new_url})
+                    if clone is not None:
+                        log.info("Rewrote hyperlink URL: %s -> %s", url, new_url)
+                        kept = clone
+            out.append(kept)
+        return out
+
+    def apply_text_filters(self, text: Optional[str], entities: Optional[list],
+                           filters: Optional[list], filter_urls: bool = True
+                           ) -> Tuple[str, list]:
+        if not filters:
+            return (text or ""), list(entities or [])
+
+        result = text or ""
         current_entities = list(entities or [])
 
         for f in filters:
@@ -532,11 +586,14 @@ class ForwarderBot:
             if not find:
                 log.warning("Ignoring text filter with an empty 'find' string")
                 continue
-            if find not in result:
+            if not result or find not in result:
                 continue
 
             result, mapping = self._replace_all(result, find, replace)
             current_entities = self._remap_entities(current_entities, mapping, len(result))
+
+        if filter_urls:
+            current_entities = self._filter_entity_urls(current_entities, filters)
 
         return result, current_entities
 
@@ -579,10 +636,103 @@ class ForwarderBot:
                 return str(media.photo.id)
             if hasattr(media, 'document') and media.document:
                 return str(media.document.id)
-        except:
+        except Exception:
             pass
         return None
-    
+
+    # ---------- media metadata (any file type) ----------
+
+    @staticmethod
+    def get_media_kind(media) -> str:
+        """Human-readable kind, used in the UI. Works for every file type."""
+        if media is None:
+            return "none"
+        photo = getattr(media, "photo", None)
+        doc = getattr(media, "document", None)
+        if photo:
+            return "🖼️ Photo"
+        if not doc:
+            return "❓ Other"
+
+        mime = (getattr(doc, "mime_type", "") or "").lower()
+        attrs = {type(a).__name__ for a in (getattr(doc, "attributes", None) or [])}
+
+        if "DocumentAttributeSticker" in attrs:
+            return "🎭 Sticker"
+        if "DocumentAttributeAnimated" in attrs:
+            return "🎞️ GIF"
+        if "DocumentAttributeVideo" in attrs:
+            return "🎬 Video"
+        if "DocumentAttributeAudio" in attrs:
+            if any(getattr(a, "voice", False)
+                   for a in (doc.attributes or [])
+                   if type(a).__name__ == "DocumentAttributeAudio"):
+                return "🎤 Voice"
+            return "🎵 Audio"
+        if mime.startswith("image/"):
+            return "🖼️ Image (as file)"
+        if mime.startswith("video/"):
+            return "🎬 Video"
+        if mime.startswith("audio/"):
+            return "🎵 Audio"
+        if mime == "application/vnd.android.package-archive":
+            return "📦 APK"
+        if mime in ("application/zip", "application/x-zip-compressed"):
+            return "🗜️ ZIP"
+        if mime == "application/pdf":
+            return "📕 PDF"
+        return f"📄 File ({mime.split('/')[-1] or 'unknown'})"
+
+    @staticmethod
+    def get_media_filename(message) -> Optional[str]:
+        """The filename the user actually sent (from DocumentAttributeFilename)."""
+        media = getattr(message, "media", None)
+        doc = getattr(media, "document", None)
+        for attr in (getattr(doc, "attributes", None) or []):
+            name = getattr(attr, "file_name", None)
+            if name:
+                return str(name)
+        try:                                    # Telethon's own resolution
+            f = message.file
+            if f is not None and f.name:
+                return str(f.name)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def get_media_size(message) -> Optional[int]:
+        media = getattr(message, "media", None)
+        doc = getattr(media, "document", None) or getattr(media, "photo", None)
+        size = getattr(doc, "size", None)
+        try:
+            return int(size) if size else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def sent_as_document(message) -> bool:
+        """True when the user sent an image explicitly 'as file'.
+
+        Telethon forces `force_file=False` for images, so without this flag an
+        image uploaded as a document would come back out as a plain photo.
+        """
+        doc = getattr(getattr(message, "media", None), "document", None)
+        if doc is None:
+            return False
+        return (getattr(doc, "mime_type", "") or "").lower().startswith("image/")
+
+    @staticmethod
+    def human_size(num: Optional[int]) -> str:
+        if not num:
+            return "?"
+        size = float(num)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+            size /= 1024.0
+        return "?"
+
     @staticmethod
     def _is_service_message(msg: Message) -> bool:
         """System messages ('X joined the group', pinned-item notices, ...)."""
@@ -598,6 +748,85 @@ class ForwarderBot:
         except Exception as e:
             log.warning("Could not refresh message %s: %s", getattr(msg, "id", "?"), e)
             return None
+
+    @staticmethod
+    def replacement_filename(mf: dict, path: str) -> str:
+        """The filename the replacement must be delivered under.
+
+        Falls back to the stored path's basename for filters created before
+        filenames were recorded, so old entries keep working.
+        """
+        name = (mf.get("replace_name") or "").strip()
+        return name or Path(path).name
+
+    @staticmethod
+    def match_media_filter(media_id: Optional[str], media_filters: list) -> Optional[dict]:
+        """First media filter whose original_id matches this media."""
+        if not media_id or not media_filters:
+            return None
+        for mf in media_filters:
+            if isinstance(mf, dict) and mf.get("original_id") == media_id:
+                return mf
+        return None
+
+    async def replacement_input_media(self, client, mf: dict, path: str):
+        """Upload the replacement and build its InputMedia with the right name.
+
+        Building the InputMedia ourselves (instead of handing `send_file` a path)
+        is what makes two things work at once:
+
+        * the file is delivered under the EXACT filename the user uploaded it
+          with — `send_file` would otherwise use our internal
+          `repl_<uid>_<id>_<ts>.apk` path name;
+        * albums can mix untouched source media with replaced files, because
+          Telethon passes a pre-built InputMedia straight through and applies
+          `attributes`/`force_document` per item rather than to the whole list.
+        """
+        name = self.replacement_filename(mf, path)
+        mime = (mimetypes.guess_type(path)[0] or "application/octet-stream").lower()
+        as_document = bool(mf.get("replace_as_document")) or not mime.startswith("image/")
+
+        file_handle = await client.upload_file(path)
+
+        if not as_document:
+            # A real photo has no filename concept in Telegram.
+            return InputMediaUploadedPhoto(file=file_handle)
+
+        # Let Telethon work out the media attributes exactly as send_file()
+        # would (duration/dimensions for video, performer/title for audio, ...)
+        # and only OVERRIDE the filename. Building this by hand with nothing but
+        # DocumentAttributeFilename would have turned videos into unplayable
+        # generic files.
+        override = [DocumentAttributeFilename(file_name=name)] if name else None
+        try:
+            attributes, detected_mime = utils.get_attributes(
+                path, attributes=override,
+                force_document=bool(mf.get("replace_as_document")))
+        except Exception as e:
+            log.warning("Attribute detection failed for %s (%s); using filename only",
+                        path, e)
+            attributes = override or []
+            detected_mime = mime
+
+        return InputMediaUploadedDocument(
+            file=file_handle,
+            mime_type=detected_mime or mime,
+            attributes=attributes,
+            force_file=bool(mf.get("replace_as_document")),
+        )
+
+    async def _send_replacement(self, client, dest_id: int, mf: dict, path: str,
+                                caption: Optional[str], entities: list):
+        """Deliver one media-filter replacement, filename preserved."""
+        media = await self.replacement_input_media(client, mf, path)
+        sent = await client.send_file(
+            dest_id, media,
+            caption=caption or None,
+            formatting_entities=entities or None,
+        )
+        log.info("Replaced media at %s with '%s'", dest_id,
+                 self.replacement_filename(mf, path))
+        return sent
 
     async def send_clean(self, client: TelegramClient, user_id: int, msg: Message,
                          dest_id: int, text_filters: list, media_filters: list,
@@ -615,23 +844,28 @@ class ForwarderBot:
         entities = list(msg.entities or [])
 
         if caption:
-            caption, entities = self.apply_text_filters(caption, entities, text_filters)
+            caption, entities = self.apply_text_filters(
+                caption, entities, text_filters,
+                filter_urls=self.want_url_filters(user_id))
             caption = clip_message(caption)
 
         try:
             if msg.media:
-                media_id = self.get_media_id(msg.media)
-                if media_id and media_filters:
-                    for mf in media_filters:
-                        if mf.get("original_id") == media_id:
-                            repl = mf.get("replace_file")
-                            if repl and Path(repl).exists():
-                                return await client.send_file(
-                                    dest_id, file=repl,
-                                    caption=caption or None,
-                                    formatting_entities=entities or None
-                                )
-                            log.error("Media filter points at a missing file: %s", repl)
+                mf = self.match_media_filter(self.get_media_id(msg.media), media_filters)
+                if mf is not None:
+                    repl = mf.get("replace_file")
+                    if repl and Path(repl).exists():
+                        return await self._send_replacement(
+                            client, dest_id, mf, repl, caption, entities)
+                    # The user explicitly asked for this media to be swapped, so
+                    # never let the ORIGINAL through — that is worse than dropping
+                    # one message. The filter list shows a ⚠️ marker so it can be
+                    # repaired.
+                    log.error(
+                        "Media filter for id %s points at a missing file (%s) "
+                        "- message %s NOT forwarded",
+                        self.get_media_id(msg.media), repl, msg.id)
+                    return SKIPPED
 
                 if hasattr(msg.media, 'document') and msg.media.document:
                     doc = msg.media.document
@@ -859,7 +1093,9 @@ class ForwarderBot:
             return
 
         use_tag = config.get("forward_with_tag", False)
-        text_filters = self.get_filters(user_id).get("text_filters", [])
+        user_filters = self.get_filters(user_id)
+        text_filters = user_filters.get("text_filters", [])
+        media_filters = user_filters.get("media_filters", [])
 
         client = await self.get_client(user_id)
         if not client:
@@ -884,35 +1120,63 @@ class ForwarderBot:
                     if not isinstance(sent, list):
                         sent = [sent]
                 else:
-                    files = []
+                    # Build one InputMedia per album item. Media filters are
+                    # applied HERE too: previously an album bypassed send_clean
+                    # entirely, so a filtered file inside a gallery leaked
+                    # through unreplaced.
+                    medias = []
                     caption = None
                     entities = None
+                    replaced = 0
 
                     for m in messages:
                         if caption is None and m.message:
                             caption, entities = self.apply_text_filters(
-                                m.message, m.entities, text_filters)
+                                m.message, m.entities, text_filters,
+                                filter_urls=self.want_url_filters(user_id))
                             caption = clip_message(caption)
 
-                        if m.media:
-                            if hasattr(m.media, 'document') and m.media.document:
-                                doc = m.media.document
-                                files.append(InputDocument(
-                                    id=doc.id, access_hash=doc.access_hash,
-                                    file_reference=doc.file_reference))
-                            elif hasattr(m.media, 'photo') and m.media.photo:
-                                photo = m.media.photo
-                                files.append(InputPhoto(
-                                    id=photo.id, access_hash=photo.access_hash,
-                                    file_reference=photo.file_reference))
+                        if not m.media:
+                            continue
 
-                    if not files:
+                        mf = self.match_media_filter(
+                            self.get_media_id(m.media), media_filters)
+
+                        if mf is not None:
+                            repl = mf.get("replace_file")
+                            if repl and Path(repl).exists():
+                                medias.append(await self.replacement_input_media(
+                                    client, mf, repl))
+                                replaced += 1
+                                continue
+                            # Never let the original through; drop this item.
+                            log.error(
+                                "Album item %s matched a media filter with a "
+                                "missing file (%s) - item dropped", m.id, repl)
+                            continue
+
+                        doc = getattr(m.media, "document", None)
+                        photo = getattr(m.media, "photo", None)
+                        if doc:
+                            medias.append(utils.get_input_media(InputDocument(
+                                id=doc.id, access_hash=doc.access_hash,
+                                file_reference=doc.file_reference)))
+                        elif photo:
+                            medias.append(utils.get_input_media(InputPhoto(
+                                id=photo.id, access_hash=photo.access_hash,
+                                file_reference=photo.file_reference)))
+
+                    if not medias:
                         return SKIPPED
+
                     sent = await client.send_file(
-                        dest_id, files, caption=caption or None,
+                        dest_id, medias, caption=caption or None,
                         formatting_entities=entities or None)
                     if not isinstance(sent, list):
                         sent = [sent]
+                    if replaced:
+                        log.info("Album to %s: %d item(s) replaced by filters",
+                                 dest_id, replaced)
 
                 # strict=False on purpose: Telegram may return fewer messages
                 # than we sent (e.g. a rejected item), and we still want to
@@ -1081,7 +1345,8 @@ class ForwarderBot:
 
             text_filters = self.get_filters(user_id).get("text_filters", [])
             new_text, new_entities = self.apply_text_filters(
-                msg.message, msg.entities, text_filters)
+                msg.message, msg.entities, text_filters,
+                filter_urls=self.want_url_filters(user_id))
             new_text = clip_message(new_text) or None
 
             client = await self.get_client(user_id)
@@ -1262,77 +1527,119 @@ class ForwarderBot:
                 safe.append(new_row)
         return safe or None
 
+    @staticmethod
+    def mask_phone(phone: Optional[str]) -> str:
+        """+916200418776 -> +91••••••8776 (never show the full number in chat)."""
+        if not phone:
+            return "—"
+        digits = "".join(ch for ch in str(phone) if ch.isdigit())
+        if len(digits) <= 4:
+            return str(phone)
+        return f"{str(phone)[:3]}{'•' * max(3, len(digits) - 6)}{digits[-4:]}"
+
     async def show_menu(self, event):
         user_id = event.sender_id
         config = self.get_config(user_id)
+        filters = self.get_filters(user_id)
 
         logged_in = bool(config.get("logged_in"))
-        status = "✅ Logged In" if logged_in else "❌ Not Logged In"
-        fwd_status = "🟢 Active" if config.get("forwarding_active") else "🔴 Stopped"
-        tag_status = "✅ ON" if config.get("forward_with_tag") else "❌ OFF"
+        n_dest = len(config.get("destinations", []))
+        n_filters = (len(filters.get("text_filters", []))
+                     + len(filters.get("media_filters", [])))
+        active = bool(config.get("forwarding_active"))
+        has_source = bool(config.get("source_chat"))
 
-        menu_text = f"""
-🤖 **Message Forwarder Bot**
-
-📊 **Status**: {status}
-📱 **Source**: {clip_message(config.get('source_chat_name') or 'Not Set')}
-📤 **Destinations**: {len(config.get('destinations', []))}
-🔄 **Forwarding**: {fwd_status}
-🏷️ **Forward Tag**: {tag_status}
-
-✨ **Features**:
-• Zero-delay forwarding
-• No tag on media (when OFF)
-• Album support
-• Edit/Delete mirroring
-• Text & Media filters
-        """
-
-        buttons = []
         if not logged_in:
-            buttons.append([Button.inline("🔐 Login", b"login")])
-        else:
-            buttons.append([Button.inline("📱 Set Source", b"set_source")])
-            buttons.append([Button.inline("📤 Manage Destinations", b"manage_dests")])
-            buttons.append([Button.inline("🔧 Filters", b"manage_filters")])
-            buttons.append([Button.inline(
-                f"🏷️ Tag: {'ON' if config.get('forward_with_tag') else 'OFF'}", b"toggle_tag")])
+            text = (
+                "🤖 **MESSAGE FORWARDER**\n"
+                f"{self.DIVIDER}\n"
+                "🔐 Not logged in yet\n\n"
+                "Log in with **your own** Telegram account to forward\n"
+                "messages from any chat or channel you can read.\n\n"
+                "You will need an **API ID** and **API Hash** from\n"
+                "https://my.telegram.org"
+            )
+            await self.reply(event, text, buttons=[
+                [Button.inline("🔐 Login now", b"login")],
+                [Button.inline("❓ How it works", b"help")],
+            ])
+            return
 
-            if config.get("source_chat") and config.get("destinations"):
-                if config.get("forwarding_active"):
-                    buttons.append([Button.inline("⏸️ Stop", b"stop_forward")])
-                else:
-                    buttons.append([Button.inline("▶️ Start", b"start_forward")])
+        source = clip_message(config.get("source_chat_name") or "— not set —")
+        text = (
+            "🤖 **MESSAGE FORWARDER**\n"
+            f"{self.DIVIDER}\n"
+            f"🔐 Account      ✅ {self.mask_phone(config.get('phone'))}\n"
+            f"📥 Source       {source}\n"
+            f"📤 Destinations {n_dest}\n"
+            f"🔧 Filters      {n_filters}\n"
+            f"⚡ Forwarding   {'🟢 ACTIVE' if active else '🔴 STOPPED'}"
+        )
 
-            buttons.append([Button.inline("🔄 Restart", b"restart")])
-            buttons.append([Button.inline("🚪 Logout", b"logout")])
+        if not has_source:
+            text += "\n\n👉 **Next step:** choose the source chat."
+        elif not n_dest:
+            text += "\n\n👉 **Next step:** add at least one destination."
+        elif not active:
+            text += "\n\n👉 Ready — press ▶️ to start forwarding."
 
-        buttons.append([Button.inline("❓ Help", b"help")])
+        buttons = [
+            [Button.inline("📥 Source chat", b"set_source"),
+             Button.inline(f"📤 Destinations ({n_dest})", b"manage_dests")],
+            [Button.inline(f"🔧 Filters ({n_filters})", b"filters"),
+             Button.inline("⚙️ Settings", b"settings")],
+        ]
 
-        await self.reply(event, menu_text, buttons=buttons)
+        if has_source and n_dest:
+            if active:
+                buttons.append([Button.inline("⏸️  STOP forwarding", b"stop_forward")])
+            else:
+                buttons.append([Button.inline("▶️  START forwarding", b"start_forward")])
+
+        buttons.append([Button.inline("📊 Status", b"status"),
+                        Button.inline("❓ Help", b"help")])
+
+        await self.reply(event, clip_message(text), buttons=buttons)
 
     async def show_help(self, event):
-        help_text = """
-📚 **Help Guide**
-
-**Setup:**
-1. Login with API ID & Hash (from https://my.telegram.org)
-2. Enter phone number and verification code
-3. Set source chat (where to forward from)
-4. Add destination chats (where to forward to)
-5. Start forwarding!
-
-**Filters:**
-• **Text Filters**: Replace words/phrases in messages
-• **Media Filters**: Replace specific media with custom files
-
-**Commands:**
-/start - Main menu
-/status - Show status
-/cancel - Abort the current step
-/help - This help
-        """
-        await self.reply(event, help_text, buttons=[Button.inline("🔙 Menu", b"back")])
+        help_text = (
+            "📚 **HOW IT WORKS**\n"
+            f"{self.DIVIDER}\n\n"
+            "**1 · Login**\n"
+            "Use YOUR account, not the bot's. Get an API ID + Hash\n"
+            "from https://my.telegram.org → API development tools.\n"
+            "This lets the bot read a channel the bot itself cannot join.\n\n"
+            "**2 · Source**\n"
+            "The chat/channel messages are copied FROM.\n\n"
+            "**3 · Destinations**\n"
+            "One or more chats they are copied TO. Add as many as you like.\n\n"
+            "**4 · Filters** _(optional)_\n\n"
+            "📝 **Text filters** — find & replace inside captions.\n"
+            "     e.g. `@oldchannel` → `@mychannel`\n"
+            "     With 🔗 Rewrite links ON, the hidden URL behind\n"
+            "     \"create link\" text is replaced too.\n\n"
+            "🖼️ **Media filters** — swap a specific file for your own.\n"
+            "     Works for ANY type: photo, video, sticker, GIF, audio,\n"
+            "     voice, **APK, ZIP, PDF** — any document.\n"
+            "     Your replacement is delivered under the SAME filename\n"
+            "     you uploaded it with.\n\n"
+            "🧪 **Test a filter** — paste sample text and preview the\n"
+            "     result before it goes to your channel.\n\n"
+            "**5 · Start**\n"
+            "Press ▶️. Albums, edits and deletes are mirrored automatically.\n\n"
+            f"{self.DIVIDER}\n"
+            "💡 **Tag mode OFF** = clean re-send, filters applied.\n"
+            "     **Tag mode ON**  = Telegram's 'Forwarded from…' header,\n"
+            "     but filters are skipped.\n\n"
+            "**Commands**\n"
+            "/start · main menu\n"
+            "/status · live status\n"
+            "/cancel · abort whatever step you are stuck in\n"
+            "/help · this guide"
+        )
+        await self.reply(event, clip_message(help_text),
+                         buttons=[[Button.inline("📊 Status", b"status"),
+                                   Button.inline("🔙 Menu", b"back")]])
 
     async def show_status(self, event):
         user_id = event.sender_id
@@ -1342,21 +1649,43 @@ class ForwarderBot:
 
         connected = bool(state.client and state.client_authorized
                          and state.client.is_connected())
+        text_filters = filters.get("text_filters", [])
+        media_filters = filters.get("media_filters", [])
+        broken = [mf for mf in media_filters
+                  if not (mf or {}).get("replace_file")
+                  or not Path((mf or {}).get("replace_file", "")).exists()]
+        mapped = len(self.get_mappings(user_id))
 
-        status_text = f"""
-📊 **Status**
+        status_text = (
+            "📊 **STATUS**\n"
+            f"{self.DIVIDER}\n"
+            f"⚡ Forwarding   {'🟢 ACTIVE' if config.get('forwarding_active') else '🔴 STOPPED'}\n"
+            f"🔌 Connection   {'🟢 Connected' if connected else '⚪ Disconnected'}\n"
+            f"🔐 Account      {'✅ ' + self.mask_phone(config.get('phone')) if config.get('logged_in') else '❌ Not logged in'}\n"
+            f"📥 Source       {clip_message(config.get('source_chat_name') or '— not set —')}\n"
+            f"📤 Destinations {len(config.get('destinations', []))}\n\n"
+            f"🏷️ Tag mode      {'ON' if config.get('forward_with_tag') else 'OFF'}\n"
+            f"🔗 Rewrite links {'ON' if self.want_url_filters(user_id) else 'OFF'}\n"
+            f"📝 Text filters  {len(text_filters)}\n"
+            f"🖼️ Media filters {len(media_filters)}\n\n"
+            f"📨 Tracked ids   {len(state.processed_messages)}\n"
+            f"🔁 Mirrored msgs {mapped}"
+        )
 
-🔐 Login: {'✅ Yes' if config.get('logged_in') else '❌ No'}
-📱 Source: {clip_message(config.get('source_chat_name') or 'Not Set')}
-📤 Destinations: {len(config.get('destinations', []))}
-🔄 Forwarding: {'🟢 Active' if config.get('forwarding_active') else '🔴 Stopped'}
-🏷️ Tag Mode: {'ON' if config.get('forward_with_tag') else 'OFF'}
-🔌 Connection: {'Connected' if connected else 'Disconnected'}
-📨 Tracked: {len(state.processed_messages)} messages
-📝 Text Filters: {len(filters.get('text_filters', []))}
-🖼️ Media Filters: {len(filters.get('media_filters', []))}
-        """
-        await self.reply(event, status_text, buttons=[Button.inline("🔙 Menu", b"back")])
+        if broken:
+            status_text += (f"\n\n⚠️ **{len(broken)} media filter(s) point at a "
+                            f"missing file.** Open Filters → Media to see which, "
+                            f"then re-add them. Those messages are NOT forwarded "
+                            f"until fixed.")
+        if config.get("forward_with_tag") and (text_filters or media_filters):
+            status_text += ("\n\n⚠️ Tag mode is ON, so your filters are being "
+                            "skipped. Turn it off in Settings.")
+
+        buttons = [[Button.inline("🔧 Filters", b"filters"),
+                    Button.inline("⚙️ Settings", b"settings")],
+                   [Button.inline("🔄 Restart", b"restart"),
+                    Button.inline("🔙 Menu", b"back")]]
+        await self.reply(event, clip_message(status_text), buttons=buttons)
     
     async def handle_callback(self, event):
         try:
@@ -1370,62 +1699,102 @@ class ForwarderBot:
 
         try:
             await event.answer()
-            
-            if data == "login":
+
+            # ---- static routes ----
+            if data == "back":
+                await self.show_menu(event)
+            elif data == "login":
                 await self.start_login(event)
-            elif data == "set_source":
-                await self.select_chat(event, "source")
-            elif data == "manage_dests":
-                await self.show_destinations(event)
-            elif data == "add_dest":
-                await self.select_chat(event, "dest")
-            elif data == "manage_filters":
-                await self.show_filters_menu(event)
-            elif data == "add_text_filter":
-                await self.start_text_filter(event)
-            elif data == "add_media_filter":
-                await self.start_media_filter(event)
-            elif data == "view_text_filters":
-                await self.view_text_filters(event)
-            elif data == "view_media_filters":
-                await self.view_media_filters(event)
-            elif data == "toggle_tag":
-                await self.toggle_tag(event)
+            elif data == "help":
+                await self.show_help(event)
+            elif data == "status":
+                await self.show_status(event)
+            elif data == "settings":
+                await self.show_settings(event)
+
+            # ---- forwarding ----
             elif data == "start_forward":
                 await self.start_forwarding_callback(event)
             elif data == "stop_forward":
                 await self.stop_forwarding_callback(event)
             elif data == "restart":
                 await self.restart_forwarding(event)
-            elif data == "logout":
+            elif data == "toggle_tag":
+                await self.toggle_tag(event)
+            elif data == "toggle_urls":
+                await self.toggle_urls(event)
+
+            # ---- chats ----
+            elif data == "set_source":
+                await self.select_chat(event, "source")
+            elif data in ("manage_dests", "add_dest"):
+                if data == "add_dest":
+                    await self.select_chat(event, "dest")
+                else:
+                    await self.show_destinations(event)
+
+            # ---- filters ----
+            elif data in ("filters", "manage_filters"):   # 2nd = legacy button
+                await self.show_filters_menu(event)
+            elif data == "add_text_filter":
+                await self.start_text_filter(event)
+            elif data == "add_media_filter":
+                await self.start_media_filter(event)
+            elif data == "view_text_filters":              # legacy button
+                await self.view_text_filters(event)
+            elif data == "view_media_filters":             # legacy button
+                await self.view_media_filters(event)
+            elif data == "test_filter":
+                await self.start_filter_test(event)
+            elif data == "confirm_clear_filters":
+                await self.confirm_clear_filters(event)
+            elif data == "do_clear_filters":
+                await self.do_clear_filters(event)
+
+            # ---- logout (always confirmed) ----
+            elif data in ("logout", "confirm_logout"):     # 1st = legacy button
+                await self.confirm_logout(event)
+            elif data == "do_logout":
                 await self.logout(event)
-            elif data == "help":
-                await self.show_help(event)
-            elif data == "back":
-                await self.show_menu(event)
-            elif data.startswith("del_dest_"):
-                await self.remove_destination(event, data[9:])
+
+            # ---- dynamic routes ----
             elif data.startswith("del_text_"):
-                await self.delete_text_filter(event, int(data[9:]))
+                await self.delete_text_filter(event, self._int_arg(data[9:]))
             elif data.startswith("del_media_"):
-                await self.delete_media_filter(event, int(data[10:]))
+                await self.delete_media_filter(event, self._int_arg(data[10:]))
+            elif data.startswith("page_tf_"):
+                await self.view_text_filters(event, self._int_arg(data[8:]))
+            elif data.startswith("page_mf_"):
+                await self.view_media_filters(event, self._int_arg(data[8:]))
+            elif data.startswith("confirm_deldest_"):
+                await self.confirm_remove_destination(event, data[16:])
+            elif data.startswith("do_deldest_"):
+                await self.remove_destination(event, data[11:])
+            elif data.startswith("del_dest_"):             # legacy button
+                await self.confirm_remove_destination(event, data[9:])
             elif data.startswith("sel_src_"):
                 await self.set_source(event, data[8:])
             elif data.startswith("sel_dst_"):
                 await self.add_destination(event, data[8:])
             elif data.startswith("page_src_") or data.startswith("page_dst_"):
                 chat_type = "source" if data.startswith("page_src_") else "dest"
-                try:
-                    page = int(data.rsplit("_", 1)[1])
-                except ValueError:
-                    page = 0
-                await self.select_chat(event, chat_type, page=page)
+                await self.select_chat(event, chat_type, page=self._int_arg(data.rsplit("_", 1)[1]))
             else:
                 log.warning("Unhandled callback data: %r", data)
-                
+
         except Exception as e:
-            log.error(f"Callback error: {e}")
-            await event.answer(f"Error: {str(e)[:50]}", alert=True)
+            log.error("Callback error on %r: %s: %s", data, type(e).__name__, e)
+            try:
+                await event.answer(f"⚠️ {type(e).__name__}: {str(e)[:60]}", alert=True)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _int_arg(value: str, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
     
     # ========== LOGIN HANDLERS ==========
     
@@ -1434,33 +1803,50 @@ class ForwarderBot:
         config = self.get_config(user_id)
         config["current_step"] = "api_id"
         self.save_config(user_id)
-        
-        await event.edit(
-            "🔐 **Login - Step 1/4**\n\nSend your **API ID**\n\nGet from: https://my.telegram.org",
-            buttons=[Button.inline("❌ Cancel", b"back")]
-        )
+
+        await self.reply(event,
+            "🔐 **LOGIN** — step 1 of 4\n"
+            f"{self.DIVIDER}\n"
+            "Send your **API ID** (a number).\n\n"
+            "**Where to get it:**\n"
+            "1. Open https://my.telegram.org\n"
+            "2. Sign in with the phone number you want to use\n"
+            "3. Tap **API development tools**\n"
+            "4. Copy the `api_id`\n\n"
+            "_Type /cancel at any point to abort._",
+            buttons=[Button.inline("❌ Cancel", b"back")])
     
     async def _download_filter_media(self, message, user_id: int, prefix: str,
                                      tag: str) -> Optional[str]:
         """Download a media message into MEDIA_FILES_DIR and return its real path.
 
-        Telethon *appends* a guessed extension when the target filename has
-        none, so the previously stored path never existed on disk and every
-        media filter failed with FileNotFoundError at send time. We now pick
-        the extension ourselves and trust the value `download_media` returns.
+        Two details that matter for "any file type" support:
+
+        * Telethon *appends* a guessed extension when the target filename has
+          none, so the previously stored path never existed on disk and every
+          media filter failed with FileNotFoundError at send time. We now build
+          a complete filename and trust the value `download_media` returns.
+        * `send_file()` does NOT forward a mime_type — it is derived from the
+          path. So the stored extension is taken from the ORIGINAL filename
+          first (most accurate: .apk, .zip, .pdf, ...), and only falls back to
+          guessing from the MIME type.
         """
-        ext = ""
-        try:
-            mime = getattr(getattr(message.media, "document", None), "mime_type", None) \
-                or getattr(getattr(message.media, "photo", None), "mime_type", None)
-            if mime:
-                ext = mimetypes.guess_extension(mime.split(";")[0].strip()) or ""
-                if ext == ".jpe":      # guess_extension's odd choice for jpeg
-                    ext = ".jpg"
-        except Exception:
+        original_name = self.get_media_filename(message) or ""
+        ext = os.path.splitext(original_name)[1].lower()
+
+        if not ext or len(ext) > 12 or not ext[1:].replace("_", "").isalnum():
             ext = ""
+            try:
+                doc = getattr(message.media, "document", None)
+                photo = getattr(message.media, "photo", None)
+                mime = getattr(doc, "mime_type", None) or getattr(photo, "mime_type", None)
+                if mime:
+                    guessed = mimetypes.guess_extension(mime.split(";")[0].strip()) or ""
+                    ext = ".jpg" if guessed == ".jpe" else guessed
+            except Exception:
+                ext = ""
         if not ext:
-            ext = ".bin"
+            ext = ".jpg" if getattr(message.media, "photo", None) else ".bin"
 
         MEDIA_FILES_DIR.mkdir(parents=True, exist_ok=True)
         target = MEDIA_FILES_DIR / f"{prefix}_{user_id}_{tag}_{int(time.time())}{ext}"
@@ -1491,7 +1877,7 @@ class ForwarderBot:
         has_media = bool(event.message.media)
 
         if step in ("api_id", "api_hash", "phone", "code", "2fa",
-                    "text_find", "text_replace") and not text:
+                    "text_find", "text_replace", "test_preview") and not text:
             await event.respond(
                 "❌ Please send text for this step (or /cancel to abort).")
             return
@@ -1540,6 +1926,10 @@ class ForwarderBot:
         elif step == "2fa":
             await self.verify_2fa(event, text)
 
+        # ---------- filter test / preview ----------
+        elif step == "test_preview":
+            await self.run_filter_test(event, text)
+
         # ---------- text filter steps ----------
         elif step == "text_find":
             if len(text.encode("utf-8")) > MAX_BUTTON_BYTES * 4:
@@ -1582,15 +1972,17 @@ class ForwarderBot:
         elif step == "media_original":
             if not has_media:
                 await event.respond(
-                    "❌ Please send the **original** media (photo/video/sticker) "
-                    "you want to replace.")
+                    "❌ Please send the **original** media you want to replace.\n"
+                    "Any type works: photo, video, sticker, GIF, audio, voice, "
+                    "APK, ZIP, PDF, any document.")
                 return
 
             media_id = self.get_media_id(event.message.media)
             if not media_id:
                 await event.respond(
-                    "❌ Could not read that media's ID. Send a photo, video or "
-                    "document (not a link/preview).")
+                    "❌ That message has no replaceable file in it.\n"
+                    "Link previews, polls, contacts and locations cannot be "
+                    "swapped — send the actual file.")
                 return
 
             filepath = await self._download_filter_media(
@@ -1599,15 +1991,36 @@ class ForwarderBot:
                 await event.respond("❌ Download failed. Please try again.")
                 return
 
+            orig_name = self.get_media_filename(event.message) or ""
+            orig_kind = self.get_media_kind(event.message.media)
+            orig_size = self.get_media_size(event.message)
+
             self.temp_filters[user_id] = {
-                "original_id": media_id, "original_file": filepath}
+                "original_id": media_id,
+                "original_file": filepath,
+                "original_name": orig_name,
+                "original_kind": orig_kind,
+                "original_size": orig_size,
+            }
             config["current_step"] = "media_replace"
             self.save_config(user_id)
-            await event.respond("✅ Original saved!\n\n**Step 2/2:** Send the **REPLACEMENT** media:")
+
+            shown = orig_name or f"(no filename — {orig_kind})"
+            await event.respond(
+                f"✅ **Original captured**\n\n"
+                f"🔎 {orig_kind}\n"
+                f"📛 `{clip_message(shown)}`\n"
+                f"📏 {self.human_size(orig_size)}\n"
+                f"🆔 `{media_id}`\n\n"
+                f"**Step 2/2:** Now send the **REPLACEMENT** file.\n"
+                f"_Whatever filename you send it with is the filename your "
+                f"channel will receive._")
 
         elif step == "media_replace":
             if not has_media:
-                await event.respond("❌ Please send the **replacement** media file.")
+                await event.respond(
+                    "❌ Please send the **replacement** file.\n"
+                    "Any type works — it does not have to match the original.")
                 return
 
             temp = self.temp_filters.get(user_id, {})
@@ -1629,11 +2042,24 @@ class ForwarderBot:
                 await event.respond("❌ Download failed. Please send the replacement again.")
                 return
 
+            repl_name = self.get_media_filename(event.message) or Path(filepath).name
+            repl_kind = self.get_media_kind(event.message.media)
+            repl_size = self.get_media_size(event.message)
+
             filters = self.get_filters(user_id)
             filters.setdefault("media_filters", []).append({
                 "original_id": orig_id,
                 "original_file": orig_file,
+                "original_name": temp.get("original_name", ""),
+                "original_kind": temp.get("original_kind", ""),
+                "original_size": temp.get("original_size"),
                 "replace_file": filepath,
+                # Sent with exactly this filename (DocumentAttributeFilename).
+                "replace_name": repl_name,
+                "replace_kind": repl_kind,
+                "replace_size": repl_size,
+                # Keeps an image that was uploaded "as file" a file, not a photo.
+                "replace_as_document": self.sent_as_document(event.message),
             })
             self.save_filters(user_id)
 
@@ -1642,7 +2068,13 @@ class ForwarderBot:
             self.temp_filters.pop(user_id, None)
 
             await event.respond(
-                f"✅ **Media Filter Added!**\n\nOriginal ID: `{orig_id[:20]}…`")
+                f"✅ **Media Filter Added!**\n\n"
+                f"🔎 When this arrives: {temp.get('original_kind') or 'media'}\n"
+                f"📛 `{clip_message(temp.get('original_name') or orig_id)}`\n\n"
+                f"♻️ It will be replaced by:\n"
+                f"📄 {repl_kind}\n"
+                f"📛 `{clip_message(repl_name)}`\n"
+                f"📏 {self.human_size(repl_size)}")
             await self.show_filters_menu(event)
 
         else:
@@ -1938,26 +2370,52 @@ class ForwarderBot:
         destinations = config.get("destinations", [])
 
         if not destinations:
-            await self.reply(event, "📤 **No destinations yet!**",
-                             buttons=[[Button.inline("➕ Add Destination", b"add_dest")],
-                                      [Button.inline("🔙 Menu", b"back")]])
+            await self.reply(event,
+                "📤 **DESTINATIONS**\n"
+                f"{self.DIVIDER}\n"
+                "No destinations yet.\n\n"
+                "Add the chat(s) or channel(s) you want messages\n"
+                "forwarded **to**. You can add several.",
+                buttons=[[Button.inline("➕ Add destination", b"add_dest")],
+                         [Button.inline("🔙 Back", b"back")]])
             return
 
-        text = f"📤 **Destinations ({len(destinations)}):**\n\n"
+        text = f"📤 **DESTINATIONS** ({len(destinations)})\n{self.DIVIDER}\n"
         buttons = []
 
-        for dest in destinations:
+        for i, dest in enumerate(destinations, start=1):
             name = dest.get("name") or str(dest.get("id"))
-            text += f"• {clip_message(name)}\n"
+            text += f"**{i}.** {clip_message(name)}\n"
             buttons.append([Button.inline(
-                f"🗑️ {clip_bytes(name, MAX_BUTTON_BYTES - 12)}",
-                f"del_dest_{dest.get('id')}".encode())])
+                f"🗑️ {i}. {clip_bytes(name, MAX_BUTTON_BYTES - 12)}",
+                f"confirm_deldest_{dest.get('id')}".encode())])
 
         text = clip_message(text)
-        buttons.append([Button.inline("➕ Add More", b"add_dest")])
-        buttons.append([Button.inline("🔙 Menu", b"back")])
+        buttons.append([Button.inline("➕ Add more", b"add_dest")])
+        buttons.append([Button.inline("🔙 Back", b"back")])
 
         await self.reply(event, text, buttons=buttons)
+
+    async def confirm_remove_destination(self, event, dest_id: str):
+        user_id = event.sender_id
+        config = self.get_config(user_id)
+        match = next((d for d in config.get("destinations", [])
+                      if str(d.get("id")) == str(dest_id)), None)
+        if match is None:
+            await event.answer("Already removed.", alert=True)
+            await self.show_destinations(event)
+            return
+
+        name = match.get("name") or dest_id
+        active = bool(config.get("forwarding_active"))
+        warn = ("\n⚠️ Forwarding is **ON** — messages stop going here\n"
+                "immediately." if active else "")
+        await self.reply(event,
+            f"⚠️ **Remove this destination?**\n{self.DIVIDER}\n"
+            f"📤 `{clip_message(str(name))}`\n\n"
+            f"Already-forwarded messages stay where they are.{warn}",
+            buttons=[[Button.inline("✅ Yes, remove it", f"do_deldest_{dest_id}".encode())],
+                     [Button.inline("❌ Keep it", b"manage_dests")]])
 
     async def remove_destination(self, event, dest_id: str):
         user_id = event.sender_id
@@ -1971,118 +2429,160 @@ class ForwarderBot:
         if len(config["destinations"]) == before:
             await event.answer("Already removed.", alert=True)
         else:
-            await event.answer("✅ Removed!")
+            await event.answer("✅ Destination removed.")
         await self.show_destinations(event)
     
-    # ========== WORKING FILTERS ==========
-    
+    # ========== FILTERS UI ==========
+
+    FILTERS_PER_PAGE = 5
+    DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
+
     async def show_filters_menu(self, event):
         user_id = event.sender_id
         filters = self.get_filters(user_id)
-        
-        text_filters = len(filters.get("text_filters", []))
-        media_filters = len(filters.get("media_filters", []))
-        
-        text = f"""
-🔧 **Filter Manager**
 
-📝 **Text Filters**: {text_filters}
-🖼️ **Media Filters**: {media_filters}
+        n_text = len(filters.get("text_filters", []))
+        n_media = len(filters.get("media_filters", []))
+        urls_on = self.want_url_filters(user_id)
 
-• Text filters replace words/phrases
-• Media filters replace specific media
-        """
-        
-        buttons = [
-            [Button.inline("📝 Add Text Filter", b"add_text_filter")],
-            [Button.inline("🖼️ Add Media Filter", b"add_media_filter")],
-        ]
-        
-        if text_filters:
-            buttons.append([Button.inline("📋 View Text Filters", b"view_text_filters")])
-        if media_filters:
-            buttons.append([Button.inline("🖼️ View Media Filters", b"view_media_filters")])
-        
-        buttons.append([Button.inline("🔙 Main Menu", b"back")])
-        
-        await event.edit(text, buttons=buttons)
-    
+        text = (
+            "🔧 **FILTERS**\n"
+            f"{self.DIVIDER}\n"
+            f"📝 Text filters   `{n_text}`\n"
+            f"🖼️ Media filters  `{n_media}`\n"
+            f"🔗 Rewrite links  {'✅ ON' if urls_on else '❌ OFF'}\n\n"
+            "**Text** — replaces words/phrases in captions.\n"
+            "**Media** — swaps a whole file for yours (any type).\n"
+            "**Links** — also rewrites the hidden URL behind "
+            "\u2060\"create link\u2060\" text."
+        )
+
+        buttons = [[Button.inline("📝 Add text filter", b"add_text_filter")]]
+        if n_text:
+            buttons.append([Button.inline(f"📋 Manage text ({n_text})", b"page_tf_0")])
+        buttons.append([Button.inline("🖼️ Add media filter", b"add_media_filter")])
+        if n_media:
+            buttons.append([Button.inline(f"🗂️ Manage media ({n_media})", b"page_mf_0")])
+        buttons.append([Button.inline(
+            f"🔗 Rewrite links: {'ON' if urls_on else 'OFF'}", b"toggle_urls")])
+        buttons.append([Button.inline("🧪 Test a filter", b"test_filter")])
+        if n_text or n_media:
+            buttons.append([Button.inline("🧹 Delete all filters", b"confirm_clear_filters")])
+        buttons.append([Button.inline("🔙 Back", b"back")])
+
+        await self.reply(event, text, buttons=buttons)
+
     async def start_text_filter(self, event):
         user_id = event.sender_id
         config = self.get_config(user_id)
         config["current_step"] = "text_find"
         self.save_config(user_id)
-        
-        await event.edit(
-            "📝 **Add Text Filter - Step 1/2**\n\n"
-            "Send the text to **FIND** (case-sensitive):",
-            buttons=[Button.inline("❌ Cancel", b"manage_filters")]
-        )
-    
+
+        await self.reply(event,
+            "📝 **ADD TEXT FILTER** — step 1/2\n"
+            f"{self.DIVIDER}\n"
+            "Send the text to **FIND**.\n\n"
+            "• Case-sensitive, exact match\n"
+            "• Works on plain text AND inside link URLs\n"
+            "• Example: `@oldchannel` or `t.me/old`\n\n"
+            "_Type /cancel at any point to abort._",
+            buttons=[Button.inline("❌ Cancel", b"filters")])
+
     async def start_media_filter(self, event):
         user_id = event.sender_id
         config = self.get_config(user_id)
         config["current_step"] = "media_original"
         self.save_config(user_id)
-        
-        await event.edit(
-            "🖼️ **Add Media Filter - Step 1/2**\n\n"
-            "Send the **ORIGINAL** media (photo/video/sticker) to replace:",
-            buttons=[Button.inline("❌ Cancel", b"manage_filters")]
-        )
-    
-    async def view_text_filters(self, event):
-        user_id = event.sender_id
-        filters = self.get_filters(user_id).get("text_filters", [])
 
-        if not filters:
-            await event.answer("No text filters!", alert=True)
+        await self.reply(event,
+            "🖼️ **ADD MEDIA FILTER** — step 1/2\n"
+            f"{self.DIVIDER}\n"
+            "Send the **ORIGINAL** file that appears in the source chat "
+            "and should be swapped out.\n\n"
+            "✅ Any type: photo, video, sticker, GIF, audio, voice,\n"
+            "   **APK, ZIP, PDF, EXE** — any document.\n"
+            "❌ Not link previews, polls or locations.\n\n"
+            "_Type /cancel at any point to abort._",
+            buttons=[Button.inline("❌ Cancel", b"filters")])
+
+    @staticmethod
+    def _pager(rows, page, per_page):
+        total = max(1, (len(rows) + per_page - 1) // per_page)
+        page = max(0, min(page, total - 1))
+        return page, total, rows[page * per_page:(page + 1) * per_page]
+
+    def _nav_row(self, prefix, page, total):
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("⬅️", f"{prefix}{page - 1}".encode()))
+        nav.append(Button.inline(f"📄 {page + 1}/{total}", f"{prefix}{page}".encode()))
+        if page + 1 < total:
+            nav.append(Button.inline("➡️", f"{prefix}{page + 1}".encode()))
+        return nav
+
+    async def view_text_filters(self, event, page: int = 0):
+        user_id = event.sender_id
+        all_filters = self.get_filters(user_id).get("text_filters", [])
+
+        if not all_filters:
+            await event.answer("No text filters yet.", alert=True)
             await self.show_filters_menu(event)
             return
 
-        text = f"📝 **Text Filters ({len(filters)}):**\n\n"
-        buttons = []
+        page, total, window = self._pager(all_filters, page, self.FILTERS_PER_PAGE)
+        text = f"📝 **TEXT FILTERS** ({len(all_filters)})\n{self.DIVIDER}\n"
 
-        for i, f in enumerate(filters):
-            if not isinstance(f, dict):
-                continue
-            find = f.get("find") or ""
-            repl = f.get("replace") or "(removed)"
-            # `.get()` — a hand-edited/older JSON without these keys used to
-            # raise KeyError and freeze the whole filters screen.
-            text += f"{i + 1}. `{clip_message(find)}` → `{clip_message(repl)}`\n"
-            buttons.append([Button.inline(f"🗑️ Delete #{i + 1}", f"del_text_{i}".encode())])
+        buttons = []
+        for offset, f in enumerate(window):
+            idx = page * self.FILTERS_PER_PAGE + offset
+            find = (f or {}).get("find") or ""
+            repl = (f or {}).get("replace")
+            repl = "(removed)" if not repl else repl
+            text += f"**{idx + 1}.** `{clip_message(find)}`\n     ⬇️ `{clip_message(repl)}`\n"
+            buttons.append([Button.inline(f"🗑️ Delete #{idx + 1}", f"del_text_{idx}".encode())])
 
         text = clip_message(text)
-        buttons.append([Button.inline("➕ Add", b"add_text_filter")])
-        buttons.append([Button.inline("🔙 Back", b"manage_filters")])
+        if total > 1:
+            buttons.append(self._nav_row("page_tf_", page, total))
+        buttons.append([Button.inline("➕ Add", b"add_text_filter"),
+                        Button.inline("🔙 Filters", b"filters")])
 
         await self.reply(event, text, buttons=buttons)
 
-    async def view_media_filters(self, event):
+    async def view_media_filters(self, event, page: int = 0):
         user_id = event.sender_id
-        filters = self.get_filters(user_id).get("media_filters", [])
+        all_filters = self.get_filters(user_id).get("media_filters", [])
 
-        if not filters:
-            await event.answer("No media filters!", alert=True)
+        if not all_filters:
+            await event.answer("No media filters yet.", alert=True)
             await self.show_filters_menu(event)
             return
 
-        text = f"🖼️ **Media Filters ({len(filters)}):**\n\n"
-        buttons = []
+        page, total, window = self._pager(all_filters, page, self.FILTERS_PER_PAGE)
+        text = f"🖼️ **MEDIA FILTERS** ({len(all_filters)})\n{self.DIVIDER}\n"
 
-        for i, f in enumerate(filters):
-            if not isinstance(f, dict):
-                continue
-            oid = str(f.get("original_id") or "?")
-            repl = f.get("replace_file") or ""
-            status = "✅" if repl and Path(repl).exists() else "⚠️ missing file"
-            text += f"{i + 1}. ID `{oid[:16]}…` {status}\n"
-            buttons.append([Button.inline(f"🗑️ Delete #{i + 1}", f"del_media_{i}".encode())])
+        buttons = []
+        for offset, entry in enumerate(window):
+            idx = page * self.FILTERS_PER_PAGE + offset
+            f = entry or {}
+            orig_name = f.get("original_name") or f.get("original_id") or "?"
+            orig_kind = f.get("original_kind") or "media"
+            repl_path = f.get("replace_file") or ""
+            repl_name = self.replacement_filename(f, repl_path) if repl_path else "?"
+            repl_kind = f.get("replace_kind") or "file"
+            exists = bool(repl_path) and Path(repl_path).exists()
+            flag = "✅" if exists else "⚠️ FILE MISSING"
+
+            text += (f"**{idx + 1}.**\n"
+                     f"  🔎 {orig_kind} `{clip_message(str(orig_name))}`\n"
+                     f"  ♻️ {repl_kind} `{clip_message(str(repl_name))}` {flag}\n")
+            buttons.append([Button.inline(f"🗑️ Delete #{idx + 1}", f"del_media_{idx}".encode())])
 
         text = clip_message(text)
-        buttons.append([Button.inline("➕ Add", b"add_media_filter")])
-        buttons.append([Button.inline("🔙 Back", b"manage_filters")])
+        if total > 1:
+            buttons.append(self._nav_row("page_mf_", page, total))
+        buttons.append([Button.inline("➕ Add", b"add_media_filter"),
+                        Button.inline("🔙 Filters", b"filters")])
 
         await self.reply(event, text, buttons=buttons)
 
@@ -2096,10 +2596,14 @@ class ForwarderBot:
             await self.view_text_filters(event)
             return
 
-        del text_filters[idx]
+        removed = text_filters.pop(idx)
         self.save_filters(user_id)
-        await event.answer("✅ Filter deleted!")
-        await self.view_text_filters(event)
+        await event.answer(f"Deleted: {str((removed or {}).get('find', ''))[:30]}")
+        if text_filters:
+            await self.view_text_filters(event, page=min(idx // self.FILTERS_PER_PAGE,
+                                                         len(text_filters) // self.FILTERS_PER_PAGE))
+        else:
+            await self.show_filters_menu(event)
 
     async def delete_media_filter(self, event, idx: int):
         user_id = event.sender_id
@@ -2111,7 +2615,7 @@ class ForwarderBot:
             await self.view_media_filters(event)
             return
 
-        entry = media_filters[idx] or {}
+        entry = media_filters.pop(idx) or {}
         for key in ("original_file", "replace_file"):
             path = entry.get(key)
             if not path:
@@ -2121,11 +2625,165 @@ class ForwarderBot:
             except Exception as e:
                 log.warning("Could not delete %s: %s", path, e)
 
-        del media_filters[idx]
         self.save_filters(user_id)
-        await event.answer("✅ Filter deleted!")
-        await self.view_media_filters(event)
-    
+        await event.answer("✅ Media filter deleted (files removed).")
+        if media_filters:
+            await self.view_media_filters(event, page=min(idx // self.FILTERS_PER_PAGE,
+                                                          len(media_filters) // self.FILTERS_PER_PAGE))
+        else:
+            await self.show_filters_menu(event)
+
+    # ---------- confirmations ----------
+
+    async def confirm_clear_filters(self, event):
+        user_id = event.sender_id
+        filters = self.get_filters(user_id)
+        n = len(filters.get("text_filters", [])) + len(filters.get("media_filters", []))
+        await self.reply(event,
+            f"⚠️ **Delete ALL {n} filters?**\n{self.DIVIDER}\n"
+            f"This also deletes the replacement files from disk.\n"
+            f"_This cannot be undone._",
+            buttons=[[Button.inline("✅ Yes, delete everything", b"do_clear_filters")],
+                     [Button.inline("❌ Keep them", b"filters")]])
+
+    async def do_clear_filters(self, event):
+        user_id = event.sender_id
+        filters = self.get_filters(user_id)
+        removed = 0
+        for mf in filters.get("media_filters", []):
+            for key in ("original_file", "replace_file"):
+                path = (mf or {}).get(key)
+                if not path:
+                    continue
+                try:
+                    Path(path).unlink(missing_ok=True)
+                    removed += 1
+                except Exception as e:
+                    log.warning("Could not delete %s: %s", path, e)
+        n = len(filters.get("text_filters", [])) + len(filters.get("media_filters", []))
+        filters["text_filters"] = []
+        filters["media_filters"] = []
+        self.save_filters(user_id)
+        await event.answer(f"Deleted {n} filters.")
+        await self.show_filters_menu(event)
+
+    # ---------- test / preview ----------
+
+    async def start_filter_test(self, event):
+        user_id = event.sender_id
+        config = self.get_config(user_id)
+        config["current_step"] = "test_preview"
+        self.save_config(user_id)
+
+        n = len(self.get_filters(user_id).get("text_filters", []))
+        await self.reply(event,
+            "🧪 **TEST YOUR FILTERS**\n"
+            f"{self.DIVIDER}\n"
+            "Send any sample text — I will show you exactly how it would look "
+            "in your channel.\n\n"
+            f"You currently have `{n}` text filter(s).\n"
+            "Hyperlink URLs are checked too.\n\n"
+            "_Type /cancel to go back._",
+            buttons=[Button.inline("❌ Cancel", b"filters")])
+
+    async def run_filter_test(self, event, sample: str):
+        user_id = event.sender_id
+        config = self.get_config(user_id)
+        filters = self.get_filters(user_id).get("text_filters", [])
+        config["current_step"] = None
+        self.save_config(user_id)
+
+        if not filters:
+            await event.respond(
+                "ℹ️ You have no text filters yet, so the text is unchanged.\n\n"
+                f"`{clip_message(sample)}`")
+            return
+
+        out, _ents = self.apply_text_filters(
+            sample, [], filters, filter_urls=self.want_url_filters(user_id))
+
+        hits = [f for f in filters
+                if isinstance(f, dict) and f.get("find") and f["find"] in sample]
+        urls_on = self.want_url_filters(user_id)
+
+        text = (
+            "🧪 **FILTER PREVIEW**\n"
+            f"{self.DIVIDER}\n"
+            f"**Before**\n`{clip_message(sample)}`\n\n"
+            f"**After**\n`{clip_message(out)}`\n\n"
+        )
+        if hits:
+            text += "✅ **Matched**\n" + "".join(
+                f"• `{clip_message(f['find'])}` → "
+                f"`{clip_message(f.get('replace') or '(removed)')}`\n" for f in hits)
+        else:
+            text += "⚠️ No filter matched this text.\n"
+
+        text += (f"\n🔗 Link rewriting: {'ON' if urls_on else 'OFF'}"
+                 f" — hidden hyperlink URLs are"
+                 f"{'' if urls_on else ' NOT'} filtered too.")
+        if out == sample and hits:
+            text += "\n\nℹ️ The visible text did not change, but a hyperlink URL may still have."
+
+        await event.respond(clip_message(text),
+                            buttons=[[Button.inline("🧪 Test again", b"test_filter")],
+                                     [Button.inline("🔙 Filters", b"filters")]])
+
+    # ========== SETTINGS UI ==========
+
+    async def show_settings(self, event):
+        user_id = event.sender_id
+        config = self.get_config(user_id)
+        tag = bool(config.get("forward_with_tag"))
+        urls = self.want_url_filters(user_id)
+
+        text = (
+            "⚙️ **SETTINGS**\n"
+            f"{self.DIVIDER}\n"
+            f"🏷️ Forward with tag   {'✅ ON' if tag else '❌ OFF'}\n"
+            f"🔗 Rewrite link URLs  {'✅ ON' if urls else '❌ OFF'}\n\n"
+            "**Tag** — ON keeps Telegram's original\n"
+            "        'Forwarded from…' header.\n"
+            "        OFF re-sends the message clean, with\n"
+            "        all your filters applied.\n\n"
+            "**Rewrite links** — ON also replaces text inside\n"
+            "        the hidden URL of a hyperlink\n"
+            "        (Telegram's \"create link\" formatting)."
+        )
+        if tag:
+            text += "\n\n⚠️ Filters do NOT apply while Tag mode is ON."
+
+        buttons = [
+            [Button.inline(f"🏷️ Tag mode: {'ON' if tag else 'OFF'}", b"toggle_tag")],
+            [Button.inline(f"🔗 Rewrite links: {'ON' if urls else 'OFF'}", b"toggle_urls")],
+            [Button.inline("🔄 Restart forwarder", b"restart")],
+            [Button.inline("🚪 Log out", b"confirm_logout")],
+            [Button.inline("🔙 Back", b"back")],
+        ]
+        await self.reply(event, text, buttons=buttons)
+
+    async def toggle_urls(self, event):
+        user_id = event.sender_id
+        config = self.get_config(user_id)
+        config["filter_urls"] = not self.want_url_filters(user_id)
+        self.save_config(user_id)
+        state = "ON ✅" if config["filter_urls"] else "OFF ❌"
+        await event.answer(f"Rewrite link URLs: {state}", alert=True)
+        await self.show_settings(event)
+
+    async def confirm_logout(self, event):
+        user_id = event.sender_id
+        config = self.get_config(user_id)
+        phone = config.get("phone") or "your account"
+        await self.reply(event,
+            f"⚠️ **Log out of {clip_message(str(phone))}?**\n{self.DIVIDER}\n"
+            f"• Forwarding stops immediately\n"
+            f"• Your session file is **deleted**\n"
+            f"• Source, destinations and filters are cleared\n\n"
+            f"_You will need a new login code to come back._",
+            buttons=[[Button.inline("✅ Yes, log me out", b"do_logout")],
+                     [Button.inline("❌ Cancel", b"settings")]])
+
     # ========== FORWARDING CONTROL ==========
 
     async def toggle_tag(self, event):
@@ -2134,8 +2792,8 @@ class ForwarderBot:
         config["forward_with_tag"] = not config.get("forward_with_tag", False)
         self.save_config(user_id)
         state = "ON ✅" if config["forward_with_tag"] else "OFF ❌"
-        await event.answer(f"Forward Tag: {state}", alert=True)
-        await self.show_menu(event)
+        await event.answer(f"Tag mode: {state}", alert=True)
+        await self.show_settings(event)
 
     async def start_forwarding_callback(self, event):
         user_id = event.sender_id

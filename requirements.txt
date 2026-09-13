@@ -1,5 +1,8 @@
 telethon==1.34.0
 python-dotenv==1.0.0
+# Lets Telethon read duration/dimensions/artist from replacement media so a
+# video stays a playable video and audio keeps its metadata when re-sent.
+hachoir==3.3.0
 aiohttp==3.9.3
 aiosignal==1.3.1
 async-timeout==4.0.3
