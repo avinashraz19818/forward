@@ -1,8 +1,36 @@
+# --- Python ---
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.log
+logs/
 bot.pid
+
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+
+# --- Telethon session files = full account access ---
+*.session
 *.session-journal
+sessions/
+bot_session.session
+
+# --- Runtime state (per-user data, regenerated at runtime) ---
+user_configs.json
+user_filters.json
+user_msg_maps.json
+processed_messages.json
+media_files/
+
+# --- Atomic-write leftovers ---
+*.json.tmp
+*.corrupt-*
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
